@@ -22,7 +22,7 @@ public class CategoryController {
     @Autowired
     private CategoryService categoryService;
 
-    @GetMapping@PostMapping
+@PostMapping
 public ResponseEntity<CategoriaResponseDTO> criarCategoria(@Valid @RequestBody CategoriaRequestDTO dto) {
     CategoriaResponseDTO novaCategoria = categoryService.criar(dto);
     return ResponseEntity.status(HttpStatus.CREATED).body(novaCategoria);
