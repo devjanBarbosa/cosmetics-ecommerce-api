@@ -1,51 +1,65 @@
 package com.ledacosmeticos.api.Service;
 
+import com.ledacosmeticos.api.DTO.CategoriaRequestDTO;
+import com.ledacosmeticos.api.DTO.CategoriaResponseDTO;
 import com.ledacosmeticos.api.Model.Categoria;
-import com.ledacosmeticos.api.Model.TipoCategoria; // 1. Importe
+import com.ledacosmeticos.api.Model.TipoCategoria;
 import com.ledacosmeticos.api.Repository.CategoriaRepository;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
 import java.util.List;
 import java.util.UUID;
 
 @Service
 public class CategoryService {
 
-    @Autowired
-    private CategoriaRepository categoriaRepository;
+    private final CategoriaRepository categoriaRepository;
 
-    // --- MÉTODO ATUALIZADO ---
-    public List<Categoria> listarTodas(TipoCategoria tipo) {
-        // Se um tipo for fornecido, filtra por ele
-        if (tipo != null) {
-            return categoriaRepository.findByTipo(tipo);
-        }
-        // Se não, retorna todas as categorias
-        return categoriaRepository.findAll();
+    public CategoryService(CategoriaRepository categoriaRepository) {
+        this.categoriaRepository = categoriaRepository;
     }
 
-      public Categoria criar(Categoria categoria) {
-        // Futuramente, podemos adicionar validações aqui
-        return categoriaRepository.save(categoria);
+    @Transactional(readOnly = true)
+    public List<CategoriaResponseDTO> listarTodas(TipoCategoria tipo) {
+        List<Categoria> categorias = (tipo != null) 
+            ? categoriaRepository.findByTipo(tipo) 
+            : categoriaRepository.findAll();
+
+        return categorias.stream()
+                .map(CategoriaResponseDTO::new)
+                .toList();
     }
 
-    public Categoria atualizar(UUID id, Categoria categoriaDados) {
+    @Transactional
+    public CategoriaResponseDTO criar(CategoriaRequestDTO dto) {
+        Categoria categoria = new Categoria();
+        categoria.setNome(dto.nome());
+        categoria.setTipo(dto.tipo());
+        categoria.setUrlImagem(dto.urlImagem());
+
+        Categoria salva = categoriaRepository.save(categoria);
+        return new CategoriaResponseDTO(salva);
+    }
+
+    @Transactional
+    public CategoriaResponseDTO atualizar(UUID id, CategoriaRequestDTO dto) {
         Categoria categoriaExistente = categoriaRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Categoria não encontrada com ID: " + id));
-        
-        categoriaExistente.setNome(categoriaDados.getNome());
-        categoriaExistente.setTipo(categoriaDados.getTipo());
-         categoriaExistente.setUrlImagem(categoriaDados.getUrlImagem()); // Permite alterar o tipo também
-        
-        return categoriaRepository.save(categoriaExistente);
+
+        categoriaExistente.setNome(dto.nome());
+        categoriaExistente.setTipo(dto.tipo());
+        categoriaExistente.setUrlImagem(dto.urlImagem());
+
+        Categoria atualizada = categoriaRepository.save(categoriaExistente);
+        return new CategoriaResponseDTO(atualizada);
     }
 
+    @Transactional
     public void deletar(UUID id) {
         if (!categoriaRepository.existsById(id)) {
             throw new RuntimeException("Categoria não encontrada com ID: " + id);
         }
-        // Adicionar verificação se a categoria está em uso por algum produto antes de apagar
         categoriaRepository.deleteById(id);
     }
-    
 }
