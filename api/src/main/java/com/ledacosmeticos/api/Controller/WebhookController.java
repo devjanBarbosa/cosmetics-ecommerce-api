@@ -1,48 +1,54 @@
 package com.ledacosmeticos.api.Controller;
 
+import com.ledacosmeticos.api.DTO.MercadoPagoWebhookDTO;
+import com.ledacosmeticos.api.Security.HMACValidator;
 import com.ledacosmeticos.api.Service.PedidoService;
-import org.springframework.beans.factory.annotation.Autowired;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import java.util.Map;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/webhooks")
+@RequiredArgsConstructor
 public class WebhookController {
 
-    @Autowired
-    private PedidoService pedidoService;
+    private final PedidoService pedidoService;
+    private final HMACValidator hmacValidator;
 
     @PostMapping("/mercadopago")
-    public ResponseEntity<Void> receberNotificacaoMercadoPago(@RequestBody Map<String, Object> notificacao) {
-        System.out.println(">>> WEBHOOK MERCADO PAGO RECEBIDO: " + notificacao);
+    public ResponseEntity<Void> receberNotificacao(
+            @RequestHeader(value = "x-signature", required = false) String xSignature,
+            @RequestParam(value = "topic", required = false) String topic,
+            @RequestParam(value = "id", required = false) String paramId,
+            @RequestBody(required = false) MercadoPagoWebhookDTO payload) {
+
+        String paymentId = null;
+
+        if (payload != null && "payment".equalsIgnoreCase(payload.type()) && payload.data() != null) {
+            paymentId = payload.data().id();
+        } else if ("payment".equalsIgnoreCase(topic) && paramId != null) {
+            paymentId = paramId;
+        }
+
+        if (paymentId == null) {
+            return ResponseEntity.ok().build();
+        }
+
+        // RF02: Validação Criptográfica de Assinatura (Fail-Fast na borda)
+        if (!hmacValidator.validarAssinatura(xSignature, paymentId)) {
+            log.warn("Assinatura HMAC inválida para notificação de pagamento ID: {}", paymentId);
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build(); // 401 Unauthorized
+        }
 
         try {
-            // 1. Validar o tipo de notificação (só nos interessam pagamentos)
-            if ("payment".equals(notificacao.get("type"))) {
-
-                // 2. Extrair o ID do pagamento de forma segura
-                @SuppressWarnings("unchecked")
-                Map<String, Object> data = (Map<String, Object>) notificacao.get("data");
-                if (data != null && data.get("id") != null) {
-                    String paymentId = data.get("id").toString();
-                    System.out.println(">>> ID do Pagamento extraído: " + paymentId);
-
-                    // 3. Delegar o processamento para o PedidoService
-                    pedidoService.processarNotificacaoPagamento(paymentId);
-                } else {
-                     System.out.println(">>> Webhook recebido sem ID de pagamento.");
-                }
-            } else {
-                 System.out.println(">>> Webhook ignorado. Tipo: " + notificacao.get("type"));
-            }
-             // 4. Retornar status 200 OK para confirmar o recebimento ao Mercado Pago
-             return ResponseEntity.ok().build();
+            pedidoService.processarNotificacaoPagamento(paymentId);
+            return ResponseEntity.ok().build(); // 200 OK
         } catch (Exception e) {
-            System.err.println("### ERRO CRÍTICO AO PROCESSAR WEBHOOK: " + e.getMessage());
-            e.printStackTrace();
-            // 5. Retornar um erro 500 para que o Mercado Pago tente reenviar a notificação.
-            return ResponseEntity.internalServerError().build();
+            log.error("Erro interno ao processar webhook: {}", e.getMessage());
+            return ResponseEntity.internalServerError().build(); // 500 para retry do gateway
         }
     }
 }
