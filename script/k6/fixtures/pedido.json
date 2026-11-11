@@ -1,0 +1,7 @@
+{
+  "nomeCliente": "Teste",
+  "whatsappCliente": "21990000001",
+  "metodoEntrega": "Retirada",
+  "metodoPagamento": "Dinheiro",
+  "itens": [{ "produtoId": "1ce05083-45d8-42ad-80b7-eb934f71c21e", "quantidade": 1 }]
+}
