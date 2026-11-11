@@ -34,3 +34,16 @@ build/
 
 ### Arquivos de configuração local ###
 /src/main/resources/application-dev.properties
+
+  hs_err_pid*.log
+   replay_pid*.log
+   .vscode/
+   .sonar/
+   uploads/
+   .github/modernize/
+hs_err_pid*.log
+replay_pid*.log
+.sonar/
+uploads/
+.github/modernize/
+-Dsonar.*
