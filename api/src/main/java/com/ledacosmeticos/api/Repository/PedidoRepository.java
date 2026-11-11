@@ -6,6 +6,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import com.ledacosmeticos.api.Model.Pedido;
@@ -19,6 +20,10 @@ public interface PedidoRepository extends JpaRepository<Pedido, UUID> {
 
     @Query("SELECT DISTINCT p FROM Pedido p JOIN FETCH p.itens i JOIN FETCH i.produto JOIN FETCH p.cliente")
     List<Pedido> findAllWithItensAndProdutos();
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Pedido p SET p.status = :novoStatus WHERE p.id = :id AND p.status = :statusAtual")
+    int atualizarStatusSe(@Param("id") UUID id, @Param("statusAtual") StatusPedido statusAtual, @Param("novoStatus") StatusPedido novoStatus);
 
     List<Pedido> findByStatus(StatusPedido status);
 

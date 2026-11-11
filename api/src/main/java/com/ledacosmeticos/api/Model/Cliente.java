@@ -1,6 +1,6 @@
 package com.ledacosmeticos.api.Model;
 
-import com.fasterxml.jackson.annotation.JsonBackReference; // 1. Adicione esta importação
+import com.fasterxml.jackson.annotation.JsonBackReference; 
 import jakarta.persistence.*;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -22,13 +22,8 @@ public class Cliente {
     @Column(unique = true, nullable = false)
     private String whatsapp;
     
-    // Adicione este campo se ainda não o fez, é importante para o Mercado Pago
     private String email; 
 
-    // ====================================================================
-    // >>> A CORREÇÃO ESTÁ AQUI <<<
-    // Adicionamos @JsonBackReference para quebrar o loop de serialização
-    // ====================================================================
     @OneToMany(mappedBy = "cliente", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     @JsonBackReference
     private List<Pedido> pedidos;

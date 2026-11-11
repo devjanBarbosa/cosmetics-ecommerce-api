@@ -3,46 +3,100 @@ package com.ledacosmeticos.api.Service;
 import com.ledacosmeticos.api.DTO.ItemPedidoResponseDTO;
 import com.ledacosmeticos.api.DTO.PedidoRequestDTO;
 import com.ledacosmeticos.api.DTO.PedidoResponseDTO;
-import com.ledacosmeticos.api.Model.*; // Importa todos os modelos de uma vez
+import com.ledacosmeticos.api.Exception.Excecoes.EstoqueInsuficiente;
+import com.ledacosmeticos.api.Exception.Excecoes.GatewayIndisponivel;
+import com.ledacosmeticos.api.Exception.Excecoes.RecursoNaoEncontrado;
+import com.ledacosmeticos.api.Model.*;
 import com.ledacosmeticos.api.Repository.ClienteRepository;
 import com.ledacosmeticos.api.Repository.PedidoRepository;
 import com.ledacosmeticos.api.Repository.ProdutoRepository;
 import com.mercadopago.exceptions.MPApiException;
 import com.mercadopago.exceptions.MPException;
 import com.mercadopago.resources.payment.Payment;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
-import java.math.BigDecimal; // 1. Use BigDecimal para cálculos monetários
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 public class PedidoService {
 
-    // --- 2. Injeção de Dependência via Construtor (Melhor Prática) ---
+    private static final String PREFIXO_TESTE_CARGA = "pay_";
+
     private final PixService pixService;
     private final ConfiguracaoService configuracaoService;
     private final PedidoRepository pedidoRepository;
     private final ProdutoRepository produtoRepository;
     private final ClienteRepository clienteRepository;
+    private final TransactionTemplate tx;
+    private final boolean bypassTesteCarga;
 
-    public PedidoService(PixService pixService, ConfiguracaoService configuracaoService, PedidoRepository pedidoRepository, ProdutoRepository produtoRepository, ClienteRepository clienteRepository) {
+    public PedidoService(PixService pixService,
+                         ConfiguracaoService configuracaoService,
+                         PedidoRepository pedidoRepository,
+                         ProdutoRepository produtoRepository,
+                         ClienteRepository clienteRepository,
+                         TransactionTemplate tx,
+                         // desligado por padrão: só ligue em ambiente de teste de carga
+                         @Value("${app.payments.test-bypass:false}") boolean bypassTesteCarga) {
         this.pixService = pixService;
         this.configuracaoService = configuracaoService;
         this.pedidoRepository = pedidoRepository;
         this.produtoRepository = produtoRepository;
         this.clienteRepository = clienteRepository;
+        this.tx = tx;
+        this.bypassTesteCarga = bypassTesteCarga;
     }
 
-    @Transactional
+    // =====================================================================
+    // CRIAÇÃO DO PEDIDO
+    // Sem @Transactional no método: a chamada ao gateway fica FORA da transação,
+    // então nenhuma conexão do pool fica presa esperando a API externa.
+    //   Transação 1: cria pedido + reserva estoque (atômico)
+    //   Fora de transação: gera PIX no Mercado Pago
+    //   Transação 2: grava os dados do PIX
+    // Se o gateway falhar, cancela o pedido e devolve o estoque (compensação).
+    // =====================================================================
     public PedidoResponseDTO criar(PedidoRequestDTO dto) {
-        // Busca ou cria o cliente
+        Pedido criado = tx.execute(s -> criarPedidoReservandoEstoque(dto));
+        UUID pedidoId = criado.getId();
+
+        if (!"Pix".equalsIgnoreCase(dto.metodoPagamento())) {
+            return tx.execute(s -> convertToDto(buscarOuFalhar(pedidoId)));
+        }
+
+        Payment pagamento;
+        try {
+            pagamento = pixService.criarCobrancaPix(criado);
+        } catch (MPException | MPApiException e) {
+            log.error("Falha ao gerar PIX do pedido {}. Cancelando e devolvendo estoque.", pedidoId, e);
+            cancelar(pedidoId);
+            throw new GatewayIndisponivel("Falha ao comunicar com o gateway de pagamento. Tente novamente.", e);
+        }
+
+        return tx.execute(s -> {
+            Pedido pedido = buscarOuFalhar(pedidoId);
+            var dados = pagamento.getPointOfInteraction().getTransactionData();
+            pedido.setPixQrCodeBase64("data:image/png;base64," + dados.getQrCodeBase64());
+            pedido.setPixCopiaECola(dados.getQrCode());
+            pedido.setPixTransactionId(pagamento.getId().toString());
+            return convertToDto(pedidoRepository.save(pedido));
+        });
+    }
+
+    private Pedido criarPedidoReservandoEstoque(PedidoRequestDTO dto) {
         Cliente cliente = findOrCreateCliente(dto);
-        
-        // Monta o objeto Pedido
+
         Pedido pedido = new Pedido();
         pedido.setCliente(cliente);
         pedido.setDataCriacao(LocalDateTime.now());
@@ -55,203 +109,250 @@ public class PedidoService {
         } else {
             pedido.setTipoEntrega(TipoEntrega.RETIRADA_NA_LOJA);
         }
-        
-        // Processa os itens e calcula os totais
+
         processarItens(pedido, dto.itens());
         calcularTotais(pedido);
-        
-        // Salva o pedido inicial
-        Pedido pedidoSalvo = pedidoRepository.save(pedido);
-
-        // Gera o PIX, se necessário
-        if ("Pix".equalsIgnoreCase(dto.metodoPagamento())) {
-            gerarPixParaPedido(pedidoSalvo);
-        }
-
-        // --- 3. Retorna o DTO, não a Entidade ---
-        return convertToDto(pedidoSalvo);
+        return pedidoRepository.save(pedido);
     }
-
-    // --- 4. Métodos Privados para Organizar a Lógica ---
 
     private Cliente findOrCreateCliente(PedidoRequestDTO dto) {
         return clienteRepository.findByWhatsapp(dto.whatsappCliente())
                 .orElseGet(() -> {
-                    Cliente novoCliente = new Cliente();
-                    novoCliente.setNome(dto.nomeCliente());
-                    novoCliente.setWhatsapp(dto.whatsappCliente());
-                    return clienteRepository.save(novoCliente);
+                    Cliente novo = new Cliente();
+                    novo.setNome(dto.nomeCliente());
+                    novo.setWhatsapp(dto.whatsappCliente());
+                    return clienteRepository.save(novo);
                 });
     }
-    
+
     private Endereco criarEndereco(PedidoRequestDTO dto) {
-        Endereco endereco = new Endereco();
-        endereco.setCep(dto.cep());
-        endereco.setLogradouro(dto.endereco());
-        endereco.setNumero(dto.numero());
-        endereco.setComplemento(dto.complemento());
-        endereco.setBairro(dto.bairro());
-        return endereco;
+        Endereco e = new Endereco();
+        e.setCep(dto.cep());
+        e.setLogradouro(dto.endereco());
+        e.setNumero(dto.numero());
+        e.setComplemento(dto.complemento());
+        e.setBairro(dto.bairro());
+        return e;
     }
 
-    private void processarItens(Pedido pedido, List<PedidoRequestDTO.ItemDTO> itemDtos) {
-        List<ItemPedido> itens = itemDtos.stream().map(itemDto -> {
-            Produto produto = produtoRepository.findById(UUID.fromString(itemDto.produtoId()))
-                    .orElseThrow(() -> new RuntimeException("Produto não encontrado com ID: " + itemDto.produtoId()));
-
-            if (produto.getEstoque() < itemDto.quantidade()) {
-                throw new RuntimeException("Estoque insuficiente para o produto: " + produto.getNome());
+    /**
+     * Reserva o estoque AQUI, uma única vez, com UPDATE condicional atômico
+     * (estoque = estoque - n WHERE estoque >= n). Dois pedidos simultâneos não
+     * conseguem vender além do estoque. Se qualquer item falhar, a transação
+     * inteira sofre rollback e as reservas anteriores desfazem junto.
+     */
+      private void processarItens(Pedido pedido, List<PedidoRequestDTO.ItemDTO> itemDtos) {
+        List<ItemPedido> itens = new ArrayList<>();
+        for (PedidoRequestDTO.ItemDTO itemDto : itemDtos) {
+            int quantidade = itemDto.quantidade();
+            if (quantidade <= 0) {
+                throw new IllegalArgumentException("Quantidade inválida para o produto " + itemDto.produtoId());
             }
-            
-            produto.setEstoque(produto.getEstoque() - itemDto.quantidade());
 
-            ItemPedido itemPedido = new ItemPedido();
-            itemPedido.setProduto(produto);
-            itemPedido.setQuantidade(itemDto.quantidade());
-            itemPedido.setPrecoUnitario(produto.getPreco());
-            itemPedido.setPedido(pedido);
-            itemPedido.setId(new ItemPedidoId()); // Mantido para compatibilidade com sua estrutura
-            
-            return itemPedido;
-        }).collect(Collectors.toList());
-        
+            UUID prodId = UUID.fromString(itemDto.produtoId());
+
+            // 1. FAZ O UPDATE PRIMEIRO (Se limpar o cache, não afeta entidades em memória)
+            if (produtoRepository.baixarEstoque(prodId, quantidade) == 0) {
+                throw new EstoqueInsuficiente("Estoque esgotado para o produto ID: " + prodId);
+            }
+
+            // 2. BUSCA O PRODUTO DEPOIS (Assim ele vem sempre no estado 'managed')
+            Produto produto = produtoRepository.findById(prodId)
+                    .orElseThrow(() -> new RecursoNaoEncontrado("Produto não encontrado com ID: " + prodId));
+
+            ItemPedido item = new ItemPedido();
+            item.setProduto(produto);
+            item.setQuantidade(quantidade);
+            item.setPrecoUnitario(produto.getPreco());
+            item.setPedido(pedido);
+            item.setId(new ItemPedidoId());
+            itens.add(item);
+        }
         pedido.setItens(itens);
     }
-
+    
     private void calcularTotais(Pedido pedido) {
         BigDecimal subtotal = pedido.getItens().stream()
-            .map(item -> BigDecimal.valueOf(item.getPrecoUnitario()).multiply(BigDecimal.valueOf(item.getQuantidade())))
-            .reduce(BigDecimal.ZERO, BigDecimal::add);
-        
-        BigDecimal taxaEntrega = BigDecimal.ZERO;
+                .map(i -> i.getPrecoUnitario().multiply(BigDecimal.valueOf(i.getQuantidade())))
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .setScale(2, RoundingMode.HALF_UP);
+
+        BigDecimal taxa = BigDecimal.ZERO;
         if (pedido.getTipoEntrega() == TipoEntrega.ENTREGA_LOCAL) {
-            taxaEntrega = new BigDecimal(configuracaoService.getTaxaEntrega());
+            taxa = new BigDecimal(String.valueOf(configuracaoService.getTaxaEntrega()))
+                    .setScale(2, RoundingMode.HALF_UP);
         }
 
+        // Ideal: migrar a entidade Pedido para BigDecimal e eliminar estes doubleValue().
         pedido.setSubtotal(subtotal.doubleValue());
-        pedido.setTaxaEntrega(taxaEntrega.doubleValue());
-        pedido.setValorTotal(subtotal.add(taxaEntrega).doubleValue());
+        pedido.setTaxaEntrega(taxa.doubleValue());
+        pedido.setValorTotal(subtotal.add(taxa).doubleValue());
     }
 
-    private void gerarPixParaPedido(Pedido pedido) {
+    // =====================================================================
+    // WEBHOOK
+    // Sem @Transactional no método: consulta ao Mercado Pago acontece antes de
+    // abrir a transação. Idempotência por UPDATE condicional atômico
+    // (PENDENTE -> EM_PREPARACAO): só UMA notificação "vence", mesmo concorrentes.
+    // O estoque NÃO é mais baixado aqui (já foi reservado na criação).
+    // =====================================================================
+    public void processarNotificacaoPagamento(String paymentId) {
+        if (bypassTesteCarga && paymentId != null && paymentId.startsWith(PREFIXO_TESTE_CARGA)) {
+            // Formato do teste de carga: "pay_<uuid de um pedido PENDENTE existente>"
+            UUID pedidoId = parseUuid(paymentId.substring(PREFIXO_TESTE_CARGA.length()));
+            if (pedidoId == null) {
+                log.warn("Bypass de teste com ID inválido: {}", paymentId);
+                return;
+            }
+            liquidar(pedidoId, null); // sem conferência de valor no modo teste
+            return;
+        }
+
+        Payment payment;
         try {
-            Payment pagamento = pixService.criarCobrancaPix(pedido);
-            pedido.setPixQrCodeBase64("data:image/png;base64," + pagamento.getPointOfInteraction().getTransactionData().getQrCodeBase64());
-            pedido.setPixCopiaECola(pagamento.getPointOfInteraction().getTransactionData().getQrCode());
-            pedido.setPixTransactionId(pagamento.getId().toString());
-            pedidoRepository.save(pedido); // Salva as informações do PIX no pedido
+            payment = pixService.buscarPagamentoPorId(paymentId);
         } catch (MPException | MPApiException e) {
-            System.err.println("### ERRO AO GERAR PIX: A transação será revertida (rollback). ###");
-            e.printStackTrace();
-            throw new RuntimeException("Falha ao comunicar com o gateway de pagamento. Tente novamente.", e);
+            // Falha transitória: 503 para o Mercado Pago reenviar com backoff
+            log.error("Falha ao consultar pagamento {} no gateway", paymentId, e);
+            throw new GatewayIndisponivel("Erro ao consultar pagamento no gateway", e);
+        }
+
+        if (payment == null) {
+            log.warn("Nenhum pagamento retornado pelo Mercado Pago para o ID: {}", paymentId);
+            return;
+        }
+        if (!"approved".equalsIgnoreCase(payment.getStatus())) {
+            log.info("Pagamento {} com status '{}': nada a fazer.", paymentId, payment.getStatus());
+            return;
+        }
+
+        UUID pedidoId = parseUuid(payment.getExternalReference());
+        if (pedidoId == null) {
+            // SEM fallback: nunca liquidar um pedido "qualquer". Log e segue (200, não adianta reenviar).
+            log.error("Pagamento {} aprovado sem external_reference válido ('{}'). Requer conciliação manual.",
+                    paymentId, payment.getExternalReference());
+            return;
+        }
+
+        liquidar(pedidoId, payment.getTransactionAmount());
+    }
+
+    private void liquidar(UUID pedidoId, BigDecimal valorPago) {
+        tx.executeWithoutResult(s -> {
+            Pedido pedido = pedidoRepository.findById(pedidoId).orElse(null);
+            if (pedido == null) {
+                log.error("Pagamento aprovado para pedido inexistente {}. Requer conciliação.", pedidoId);
+                return;
+            }
+
+            if (valorPago != null) {
+                BigDecimal esperado = BigDecimal.valueOf(pedido.getValorTotal()).setScale(2, RoundingMode.HALF_UP);
+                if (esperado.compareTo(valorPago.setScale(2, RoundingMode.HALF_UP)) != 0) {
+                    log.error("Valor divergente no pedido {}: esperado {}, pago {}. Não liquidado.",
+                            pedidoId, esperado, valorPago);
+                    return;
+                }
+            }
+
+            int atualizados = pedidoRepository.atualizarStatusSe(
+                    pedidoId, StatusPedido.PENDENTE, StatusPedido.EM_PREPARACAO);
+
+            if (atualizados == 0) {
+                log.info("Pedido {} não está PENDENTE (já processado/cancelado). Notificação ignorada.", pedidoId);
+                return;
+            }
+            log.info("Pedido {} liquidado com sucesso.", pedidoId);
+        });
+    }
+
+    // =====================================================================
+    // CANCELAMENTO / EXPIRAÇÃO: devolve o estoque reservado
+    // =====================================================================
+    public void cancelarPorExpiracao(UUID pedidoId) {
+        if (cancelar(pedidoId)) {
+            log.info("Pedido {} expirado: cancelado e estoque devolvido.", pedidoId);
         }
     }
 
+    /** Só cancela se ainda estiver PENDENTE. Se o pagamento chegou antes, não faz nada. */
+    private boolean cancelar(UUID pedidoId) {
+        return Boolean.TRUE.equals(tx.execute(s -> {
+            if (pedidoRepository.atualizarStatusSe(pedidoId, StatusPedido.PENDENTE, StatusPedido.CANCELADO) == 0) {
+                return false;
+            }
+            Pedido pedido = buscarOuFalhar(pedidoId);
+            for (ItemPedido item : pedido.getItens()) {
+                produtoRepository.reporEstoque(item.getProduto().getId(), item.getQuantidade());
+            }
+            return true;
+        }));
+    }
+
+    // =====================================================================
+    // CONSULTAS
+    // =====================================================================
     @Transactional(readOnly = true)
     public List<PedidoResponseDTO> listarTodos() {
-        List<Pedido> pedidos = pedidoRepository.findAll();
-        return pedidos.stream()
-                .map(this::convertToDto)
-                .collect(Collectors.toList());
+        // TODO: paginar (Pageable) e usar join fetch/EntityGraph para evitar N+1
+        return pedidoRepository.findAll().stream().map(this::convertToDto).collect(Collectors.toList());
     }
 
     @Transactional(readOnly = true)
     public PedidoResponseDTO buscarPorId(UUID id) {
-        Pedido pedido = pedidoRepository.findById(id)
-            .orElseThrow(() -> new RuntimeException("Pedido não encontrado com ID: " + id));
-        return convertToDto(pedido);
+        return convertToDto(buscarOuFalhar(id));
     }
-
 
     @Transactional
     public PedidoResponseDTO atualizarStatus(UUID id, StatusPedido novoStatus) {
-        Pedido pedido = pedidoRepository.findById(id)
-            .orElseThrow(() -> new RuntimeException("Pedido não encontrado com ID: " + id));
-        
+        Pedido pedido = buscarOuFalhar(id);
         pedido.setStatus(novoStatus);
-        Pedido pedidoSalvo = pedidoRepository.save(pedido);
-        return convertToDto(pedidoSalvo);
+        return convertToDto(pedidoRepository.save(pedido));
     }
 
-    // Dentro da classe PedidoService
+    // =====================================================================
+    // AUXILIARES
+    // =====================================================================
+    private Pedido buscarOuFalhar(UUID id) {
+        return pedidoRepository.findById(id)
+                .orElseThrow(() -> new RecursoNaoEncontrado("Pedido não encontrado com ID: " + id));
+    }
 
-private PedidoResponseDTO convertToDto(Pedido pedido) {
-    List<ItemPedidoResponseDTO> itensDto = pedido.getItens().stream()
-        .map(item -> new ItemPedidoResponseDTO(
-            item.getProduto().getNome(),
-            item.getQuantidade(),
-            item.getPrecoUnitario()
-        ))
-        .collect(Collectors.toList());
-
-    // --- Verificação de Segurança para o Cliente ---
-    String nomeCliente = pedido.getCliente() != null ? pedido.getCliente().getNome() : "Cliente não informado";
-    String whatsappCliente = pedido.getCliente() != null ? pedido.getCliente().getWhatsapp() : "N/A";
-
-    // --- Verificação de Segurança para o Endereço ---
-    // Esta é a correção principal para o erro que você encontrou.
-    String cep = pedido.getEndereco() != null ? pedido.getEndereco().getCep() : null;
-    String endereco = pedido.getEndereco() != null ? pedido.getEndereco().getLogradouro() : null;
-    String numero = pedido.getEndereco() != null ? pedido.getEndereco().getNumero() : null;
-    String complemento = pedido.getEndereco() != null ? pedido.getEndereco().getComplemento() : null;
-    String bairro = pedido.getEndereco() != null ? pedido.getEndereco().getBairro() : null;
-
-    // OBS: Note que seu DTO tem o campo "dataCriacao", mas a entidade Pedido
-    // tem "dataDoPedido". Estou usando "getDataDoPedido()" para alinhar com a entidade.
-    return new PedidoResponseDTO(
-        pedido.getId().toString(),
-        pedido.getDataCriacao(),
-        nomeCliente,
-        whatsappCliente,
-        pedido.getStatus(),
-        pedido.getSubtotal(),
-        pedido.getTaxaEntrega(),
-        pedido.getValorTotal(),
-        itensDto,
-        pedido.getTipoEntrega(), // Alinhado com a entidade Pedido
-        pedido.getMetodoPagamento(),
-        cep,
-        endereco,
-        numero,
-        complemento,
-        bairro,
-        pedido.getPixCopiaECola(),
-        pedido.getPixQrCodeBase64()
-    );
-}
-
-     @Transactional
-    public void processarNotificacaoPagamento(String paymentId) {
+    private UUID parseUuid(String valor) {
+        if (valor == null || valor.isBlank()) return null;
         try {
-            // 1. Busca os detalhes do pagamento na API do Mercado Pago para confirmar o status
-            Payment pagamento = pixService.buscarPagamentoPorId(paymentId);
-
-            // 2. Verifica se o pagamento foi aprovado
-            if (pagamento != null && "approved".equals(pagamento.getStatus())) {
-                System.out.println(">>> Pagamento ID " + paymentId + " foi aprovado.");
-
-                // 3. Encontra o pedido correspondente no nosso banco de dados
-                Pedido pedido = pedidoRepository.findByPixTransactionId(paymentId)
-                    .orElseThrow(() -> new RuntimeException("Pedido não encontrado para o paymentId: " + paymentId));
-
-                // 4. Atualiza o status do pedido, se ele ainda estiver pendente
-                if (pedido.getStatus() == StatusPedido.PENDENTE) {
-                    pedido.setStatus(StatusPedido.EM_PREPARACAO);
-                    pedidoRepository.save(pedido);
-                    System.out.println(">>> Pedido ID " + pedido.getId() + " atualizado para EM PREPARAÇÃO.");
-                } else {
-                    System.out.println(">>> Pedido ID " + pedido.getId() + " já foi processado. Status atual: " + pedido.getStatus());
-                }
-            } else {
-                System.out.println(">>> Pagamento ID " + paymentId + " não foi aprovado. Status: " + (pagamento != null ? pagamento.getStatus() : "N/A"));
-                // Opcional: Implementar lógica para pagamentos rejeitados (ex: cancelar pedido)
-            }
-
-        } catch (Exception e) {
-            System.err.println("### ERRO ao processar notificação para o paymentId " + paymentId + ": " + e.getMessage());
-            e.printStackTrace();
-            // Lançar uma exceção garante que, se algo falhar, a transação seja desfeita.
-            throw new RuntimeException("Falha ao processar notificação de pagamento.", e);
+            return UUID.fromString(valor);
+        } catch (IllegalArgumentException e) {
+            return null;
         }
+    }
+
+    private PedidoResponseDTO convertToDto(Pedido pedido) {
+        List<ItemPedidoResponseDTO> itensDto = pedido.getItens().stream()
+                .map(i -> new ItemPedidoResponseDTO(i.getProduto().getNome(), i.getQuantidade(), i.getPrecoUnitario()))
+                .collect(Collectors.toList());
+
+        Cliente cliente = pedido.getCliente();
+        Endereco end = pedido.getEndereco();
+
+        return new PedidoResponseDTO(
+                pedido.getId().toString(),
+                pedido.getDataCriacao(),
+                cliente != null ? cliente.getNome() : "Cliente não informado",
+                cliente != null ? cliente.getWhatsapp() : "N/A",
+                pedido.getStatus(),
+                pedido.getSubtotal(),
+                pedido.getTaxaEntrega(),
+                pedido.getValorTotal(),
+                itensDto,
+                pedido.getTipoEntrega(),
+                pedido.getMetodoPagamento(),
+                end != null ? end.getCep() : null,
+                end != null ? end.getLogradouro() : null,
+                end != null ? end.getNumero() : null,
+                end != null ? end.getComplemento() : null,
+                end != null ? end.getBairro() : null,
+                pedido.getPixCopiaECola(),
+                pedido.getPixQrCodeBase64()
+        );
     }
 }

@@ -1,4 +1,6 @@
 package com.ledacosmeticos.api.Model;
+import java.math.BigDecimal;
+
 import com.fasterxml.jackson.annotation.JsonBackReference;
 
 import jakarta.persistence.*;
@@ -20,5 +22,5 @@ public class ItemPedido {
     @ManyToOne @MapsId("produtoId") @JoinColumn(name = "produto_id")
     private Produto produto;
     private Integer quantidade;
-    private Double precoUnitario;
+    private BigDecimal precoUnitario;
 }
