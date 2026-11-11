@@ -1,9 +1,15 @@
 package com.ledacosmeticos.api.Controller;
 
+import com.ledacosmeticos.api.DTO.ProdutoRequestDTO;
+import com.ledacosmeticos.api.DTO.ProdutoResponseDTO;
 import com.ledacosmeticos.api.Model.Produto;
 import com.ledacosmeticos.api.Model.TipoCategoria;
 import com.ledacosmeticos.api.Service.ProdutoService;
+
+import jakarta.validation.Valid;
+
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -18,11 +24,6 @@ public class ProdutoController {
     @Autowired
     private ProdutoService produtoService;
 
-    // ====================================================================
-    // >>> INÍCIO DA CORREÇÃO: REORDENAÇÃO DOS ENDPOINTS <<<
-    // ====================================================================
-
-    // 1. Endpoint específico para o ADMIN (agora vem primeiro)
     @GetMapping("/admin")
     public ResponseEntity<List<Produto>> listarProdutosParaAdmin(
             @RequestParam(name = "nome", required = false) String nome,
@@ -33,7 +34,6 @@ public class ProdutoController {
         return ResponseEntity.ok(produtos);
     }
     
-    // 2. Endpoint público para pesquisa (também específico)
     @GetMapping("/buscar")
     public ResponseEntity<List<Produto>> pesquisarProdutos(@RequestParam("q") String termoDePesquisa) {
         List<Produto> produtosEncontrados = produtoService.pesquisarPorNome(termoDePesquisa);
@@ -49,7 +49,7 @@ public class ProdutoController {
             .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
-    // --- O resto do controller não muda ---
+
 
     @GetMapping
     public ResponseEntity<List<Produto>> listarTodosOsProdutos(
@@ -67,20 +67,18 @@ public class ProdutoController {
     }
 
     @PostMapping
-    public ResponseEntity<Produto> cadastrarProduto(@RequestBody Produto produto) {
-        Produto novoProduto = produtoService.cadastrar(produto);
-        return ResponseEntity.status(201).body(novoProduto);
-    }
+public ResponseEntity<ProdutoResponseDTO> cadastrarProduto(@Valid @RequestBody ProdutoRequestDTO dto) {
+    ProdutoResponseDTO novoProduto = produtoService.cadastrar(dto);
+    return ResponseEntity.status(HttpStatus.CREATED).body(novoProduto);
+}
 
-    @PutMapping("/{id}")
-    public ResponseEntity<Produto> atualizarProduto(@PathVariable UUID id, @RequestBody Produto produto) {
-        try {
-            Produto produtoAtualizado = produtoService.atualizar(id, produto);
-            return ResponseEntity.ok(produtoAtualizado);
-        } catch (RuntimeException e) {
-            return ResponseEntity.notFound().build();
-        }
-    }
+@PutMapping("/{id}")
+public ResponseEntity<ProdutoResponseDTO> atualizarProduto(
+        @PathVariable UUID id, 
+        @Valid @RequestBody ProdutoRequestDTO dto) {
+    ProdutoResponseDTO atualizado = produtoService.atualizar(id, dto);
+    return ResponseEntity.ok(atualizado);
+}
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deletarProduto(@PathVariable UUID id) {

@@ -1,7 +1,9 @@
 package com.ledacosmeticos.api.DTO;
 
+import java.math.BigDecimal;
+
 public record ItemPedidoResponseDTO(
     String nomeProduto,
     Integer quantidade,
-    Double precoUnitario
+    BigDecimal precoUnitario
 ) {}

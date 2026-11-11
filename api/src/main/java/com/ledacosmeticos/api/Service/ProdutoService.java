@@ -1,9 +1,14 @@
 package com.ledacosmeticos.api.Service;
 
+import com.ledacosmeticos.api.DTO.ProdutoRequestDTO;
+import com.ledacosmeticos.api.DTO.ProdutoResponseDTO;
+import com.ledacosmeticos.api.Model.Categoria;
 import com.ledacosmeticos.api.Model.Produto;
 import com.ledacosmeticos.api.Model.TipoCategoria;
+import com.ledacosmeticos.api.Repository.CategoriaRepository;
 import com.ledacosmeticos.api.Repository.ProdutoRepository;
-import org.springframework.beans.factory.annotation.Autowired;
+import lombok.RequiredArgsConstructor;
+
 import org.springframework.data.jpa.domain.Specification; // <-- NOVA IMPORTAÇÃO
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -13,18 +18,13 @@ import java.util.Optional;
 import java.util.UUID;
 
 @Service
-public class ProdutoService {
+@RequiredArgsConstructor
+public class ProdutoService { 
 
-    @Autowired
-    private ProdutoRepository produtoRepository;
-
-    // --- NOVA INJEÇÃO DE DEPENDÊNCIA ---
-    @Autowired
-    private ProdutoSpecification produtoSpecification;
-
-    // ... (os seus outros métodos como cadastrar, atualizar, etc., não mudam)
-
-    // --- MÉTODO ATUALIZADO PARA USAR SPECIFICATIONS ---
+    private final ProdutoRepository produtoRepository;
+    private final CategoriaRepository categoriaRepository;
+    private final ProdutoSpecification produtoSpecification; 
+    
     public List<Produto> listarParaAdmin(String nome, UUID categoriaId, Boolean ativo) {
         // 1. Pedimos ao nosso construtor para criar a query com os filtros recebidos
         Specification<Produto> spec = produtoSpecification.findWithFilters(nome, categoriaId, ativo);
@@ -46,10 +46,25 @@ public class ProdutoService {
         return produtoRepository.findByAtivoTrue();
     }
 
-    public Produto cadastrar(Produto produto){
-        produto.setAtivo(true);
-        return produtoRepository.save(produto);
-    }
+    @Transactional
+public ProdutoResponseDTO cadastrar(ProdutoRequestDTO dto) {
+    Categoria categoria = categoriaRepository.findById(dto.categoriaId())
+            .orElseThrow(() -> new RuntimeException("Categoria não encontrada com ID: " + dto.categoriaId()));
+
+    // 2. Mapear os dados do DTO para a nova entidade Produto
+    Produto produto = new Produto();
+    produto.setNome(dto.nome());
+    produto.setDescricao(dto.descricao());
+    produto.setPreco(dto.preco());
+    produto.setEstoque(dto.estoque());
+    produto.setUrlImagem(dto.urlImagem());
+    produto.setCategoria(categoria);
+    produto.setAtivo(true); 
+    Produto produtoSalvo = produtoRepository.save(produto);
+
+    // 4. Converter e retornar o DTO de resposta
+    return new ProdutoResponseDTO(produtoSalvo);
+}
     
     public List<Produto> pesquisarPorNome(String nome) {
         return produtoRepository.findByNomeContainingIgnoreCaseAndAtivoTrue(nome);
@@ -59,20 +74,24 @@ public class ProdutoService {
         return produtoRepository.findById(id);
     }
 
-    public Produto atualizar(UUID id, Produto produtoComNovosDados) {
-        Produto produtoExistente = produtoRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Produto não encontrado!"));
+    @Transactional
+public ProdutoResponseDTO atualizar(UUID id, ProdutoRequestDTO dto) {
+    Produto produtoExistente = produtoRepository.findById(id)
+            .orElseThrow(() -> new RuntimeException("Produto não encontrado com ID: " + id));
 
-        produtoExistente.setNome(produtoComNovosDados.getNome());
-        produtoExistente.setDescricao(produtoComNovosDados.getDescricao());
-        produtoExistente.setPreco(produtoComNovosDados.getPreco());
-        produtoExistente.setUrlImagem(produtoComNovosDados.getUrlImagem());
-        produtoExistente.setEstoque(produtoComNovosDados.getEstoque());
-        produtoExistente.setCategoria(produtoComNovosDados.getCategoria());
+    Categoria categoria = categoriaRepository.findById(dto.categoriaId())
+            .orElseThrow(() -> new RuntimeException("Categoria não encontrada com ID: " + dto.categoriaId()));
 
-        return produtoRepository.save(produtoExistente);
-    }
+    produtoExistente.setNome(dto.nome());
+    produtoExistente.setDescricao(dto.descricao());
+    produtoExistente.setPreco(dto.preco());
+    produtoExistente.setUrlImagem(dto.urlImagem());
+    produtoExistente.setEstoque(dto.estoque());
+    produtoExistente.setCategoria(categoria);
 
+    Produto produtoAtualizado = produtoRepository.save(produtoExistente);
+    return new ProdutoResponseDTO(produtoAtualizado);
+}
     @Transactional
     public void inativar(UUID id) {
         Produto produto = produtoRepository.findById(id)

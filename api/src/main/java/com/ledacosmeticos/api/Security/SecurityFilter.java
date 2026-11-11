@@ -40,6 +40,8 @@ public class SecurityFilter extends OncePerRequestFilter {
         filterChain.doFilter(request, response);
     }
 
+    
+
     // --- MÉTODO DE RECUPERAÇÃO DE TOKEN ATUALIZADO ---
     private String recuperarToken(HttpServletRequest request) {
         // 1. Tenta recuperar o token do cookie primeiro
