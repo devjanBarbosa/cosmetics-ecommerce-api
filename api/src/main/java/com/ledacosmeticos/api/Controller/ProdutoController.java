@@ -60,8 +60,6 @@ public class ProdutoController {
             List<Produto> produtos = produtoService.listarTodos(categoriaId, sortBy, tipo);
             return ResponseEntity.ok(produtos);
         } catch (Exception e) {
-            System.err.println("Erro ao listar produtos: " + e.getMessage());
-            e.printStackTrace();
             return ResponseEntity.internalServerError().build();
         }
     }
